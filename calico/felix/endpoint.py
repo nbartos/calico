@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2015 Metaswitch Networks
-# All Rights Reserved.
+# Copyright (c) 2015 Metaswitch Networks.  All Rights Reserved.
+# Copyright (c) 2015 Cisco Systems.  All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -20,6 +20,7 @@ felix.endpoint
 Endpoint management.
 """
 import logging
+from calico.common import nat_key
 from calico.datamodel_v1 import (
     ENDPOINT_STATUS_UP, ENDPOINT_STATUS_DOWN, ENDPOINT_STATUS_ERROR
 )
@@ -43,6 +44,7 @@ class EndpointManager(ReferenceManager):
                  iptables_updater,
                  dispatch_chains,
                  rules_manager,
+                 fip_manager,
                  status_reporter):
         super(EndpointManager, self).__init__(qualifier=ip_type)
 
@@ -56,6 +58,7 @@ class EndpointManager(ReferenceManager):
         self.dispatch_chains = dispatch_chains
         self.rules_mgr = rules_manager
         self.status_reporter = status_reporter
+        self.fip_manager = fip_manager
 
         # All endpoint dicts that are on this host.
         self.endpoints_by_id = {}
@@ -76,6 +79,7 @@ class EndpointManager(ReferenceManager):
                              self.iptables_updater,
                              self.dispatch_chains,
                              self.rules_mgr,
+                             self.fip_manager,
                              self.status_reporter)
 
     def _on_object_started(self, endpoint_id, obj):
@@ -88,14 +92,19 @@ class EndpointManager(ReferenceManager):
 
     @actor_message()
     def apply_snapshot(self, endpoints_by_id):
-        # Tell the dispatch chains about the local endpoints in advance so
-        # that we don't flap the dispatch chain at start-of-day.
+        # Tell the dispatch & floating IP chains about the local endpoints in
+        # advance so that we don't flap them at start-of-day.
         local_iface_name_to_ep_id = {}
+        nat_maps = {}
         for ep_id, ep in endpoints_by_id.iteritems():
             if ep and ep_id.host == self.config.HOSTNAME and ep.get("name"):
                 local_iface_name_to_ep_id[ep.get("name")] = ep_id
+                if ep.get(nat_key(self.ip_type), None):
+                    nat_maps[ep.get("name")] = ep.get(nat_key(self.ip_type))
+
         self.dispatch_chains.apply_snapshot(local_iface_name_to_ep_id.keys(),
                                             async=True)
+        self.fip_manager.apply_snapshot(nat_maps, async=True)
         # Then update/create endpoints and work out which endpoints have been
         # deleted.
         missing_endpoints = set(self.endpoints_by_id.keys())
@@ -175,7 +184,7 @@ class EndpointManager(ReferenceManager):
 class LocalEndpoint(RefCountedActor):
 
     def __init__(self, config, combined_id, ip_type, iptables_updater,
-                 dispatch_chains, rules_manager, status_reporter):
+                 dispatch_chains, rules_manager, fip_manager, status_reporter):
         """
         Controls a single local endpoint.
 
@@ -184,6 +193,7 @@ class LocalEndpoint(RefCountedActor):
         :param iptables_updater: IptablesUpdater to use
         :param dispatch_chains: DispatchChains to use
         :param rules_manager: RulesManager to use
+        :param fip_manager: FloatingIPManager to use
         """
         super(LocalEndpoint, self).__init__(qualifier="%s(%s)" %
                                             (combined_id.endpoint, ip_type))
@@ -200,6 +210,7 @@ class LocalEndpoint(RefCountedActor):
         self.dispatch_chains = dispatch_chains
         self.rules_mgr = rules_manager
         self.status_reporter = status_reporter
+        self.fip_manager = fip_manager
 
         # Helper for acquiring/releasing profiles.
         self.rules_ref_helper = RefHelper(self, rules_manager,
@@ -453,6 +464,12 @@ class LocalEndpoint(RefCountedActor):
                     # table.
                     _log.debug("IP addresses changed, need to update routing")
                     self._device_in_sync = False
+                for key in "ipv4_nat", "ipv6_nat":
+                    if (self.endpoint.get(key, None) !=
+                            pending_endpoint.get(key, None)):
+                        _log.debug("NAT mappings have changed, refreshing.")
+                        self._device_in_sync = False
+                        self._iptables_in_sync = False
         else:
             # Delete of the endpoint.  Need to resync everything.
             profile_ids = set()
@@ -474,11 +491,15 @@ class LocalEndpoint(RefCountedActor):
                                             self.endpoint["profile_ids"])
         try:
             self.iptables_updater.rewrite_chains(updates, deps, async=False)
+            self.fip_manager.update_endpoint(self._iface_name,
+                    self.endpoint.get(nat_key(self.ip_type), None), async=True)
         except FailedSystemCall:
             _log.exception("Failed to program chains for %s. Removing.", self)
             try:
                 self.iptables_updater.delete_chains(chain_names(self._suffix),
                                                     async=False)
+                self.fip_manager.update_endpoint(self._iface_name, None,
+                                                 async=True)
             except FailedSystemCall:
                 _log.exception("Failed to remove chains after original "
                                "failure")
@@ -490,6 +511,7 @@ class LocalEndpoint(RefCountedActor):
         try:
             self.iptables_updater.delete_chains(chain_names(self._suffix),
                                                 async=True)
+            self.fip_manager.update_endpoint(self._iface_name, None, async=True)
         except FailedSystemCall:
             _log.exception("Failed to delete chains for %s", self)
         else:
@@ -517,6 +539,8 @@ class LocalEndpoint(RefCountedActor):
             ips = set()
             for ip in self.endpoint.get(self.nets_key, []):
                 ips.add(futils.net_to_ip(ip))
+            for nat_map in self.endpoint.get(nat_key(self.ip_type), []):
+                ips.add(nat_map['out_ip'])
             devices.set_routes(self.ip_type, ips,
                                self._iface_name,
                                self.endpoint["mac"],
