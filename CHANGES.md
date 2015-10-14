@@ -1,5 +1,6 @@
 # Changelog
 
+- Add floating IP support (via 1:1 NAT) in Felix.
 - Felix now parses the etcd snapshot in parallel with the event stream;
   this dramatically increases scale when under load.
 

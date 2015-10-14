@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright 2015 Metaswitch Networks
+# Copyright 2015 Cisco Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -230,9 +231,62 @@ class TestRules(BaseTestCase):
         m_v6_upd = Mock(spec=IptablesUpdater)
         m_v6_raw_upd = Mock(spec=IptablesUpdater)
         m_v4_nat_upd = Mock(spec=IptablesUpdater)
+        m_v6_nat_upd = Mock(spec=IptablesUpdater)
 
         frules.install_global_rules(m_config, m_v4_upd, m_v6_upd, m_v4_nat_upd,
-                                    m_v6_raw_upd)
+                                    m_v6_nat_upd, m_v6_raw_upd)
+
+        self.assertEqual(
+            m_v4_nat_upd.ensure_rule_inserted.mock_calls,
+            [
+                call("PREROUTING --jump felix-PREROUTING", async=False),
+                call("POSTROUTING --jump felix-POSTROUTING", async=False),
+            ]
+        )
+
+        expected_chains = {
+            'felix-FIP-DNAT': [],
+            'felix-FIP-SNAT': [],
+            'felix-PREROUTING': [
+                '--append felix-PREROUTING --jump felix-FIP-DNAT',
+                '--append felix-PREROUTING --protocol tcp --dport 80 --destination '
+                    '169.254.169.254/32 --jump DNAT --to-destination 123.0.0.1:1234'
+            ],
+            'felix-POSTROUTING': [
+                '--append felix-POSTROUTING --jump felix-FIP-SNAT'
+            ]
+        }
+        m_v4_nat_upd.rewrite_chains.assert_called_once_with(
+            expected_chains, {
+                'felix-PREROUTING': ['felix-FIP-DNAT'],
+                'felix-POSTROUTING': ['felix-FIP-SNAT']
+            }, async=False
+        )
+
+        self.assertEqual(
+            m_v6_nat_upd.ensure_rule_inserted.mock_calls,
+            [
+                call("PREROUTING --jump felix-PREROUTING", async=False),
+                call("POSTROUTING --jump felix-POSTROUTING", async=False),
+            ]
+        )
+
+        expected_chains = {
+            'felix-FIP-DNAT': [],
+            'felix-FIP-SNAT': [],
+            'felix-PREROUTING': [
+                '--append felix-PREROUTING --jump felix-FIP-DNAT'
+            ],
+            'felix-POSTROUTING': [
+                '--append felix-POSTROUTING --jump felix-FIP-SNAT'
+            ]
+        }
+        m_v6_nat_upd.rewrite_chains.assert_called_once_with(
+            expected_chains, {
+                'felix-PREROUTING': ['felix-FIP-DNAT'],
+                'felix-POSTROUTING': ['felix-FIP-SNAT']
+            }, async=False
+        )
 
         m_v6_raw_upd.ensure_rule_inserted.assert_called_once_with(
             'PREROUTING --in-interface tap+ --match rpfilter --invert -j DROP',
