@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright 2015 Metaswitch Networks
+# Copyright (c) 2015 Cisco Systems.  All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -135,6 +136,7 @@ MAX_MULTIPORT_ENTRIES = 15
 # Chain names
 FELIX_PREFIX = "felix-"
 CHAIN_PREROUTING = FELIX_PREFIX + "PREROUTING"
+CHAIN_POSTROUTING = FELIX_PREFIX + "POSTROUTING"
 CHAIN_INPUT = FELIX_PREFIX + "INPUT"
 CHAIN_FORWARD = FELIX_PREFIX + "FORWARD"
 CHAIN_TO_ENDPOINT = FELIX_PREFIX + "TO-ENDPOINT"
@@ -144,6 +146,8 @@ CHAIN_FROM_LEAF = FELIX_PREFIX + "FROM-EP-PFX"
 CHAIN_TO_PREFIX = FELIX_PREFIX + "to-"
 CHAIN_FROM_PREFIX = FELIX_PREFIX + "from-"
 CHAIN_PROFILE_PREFIX = FELIX_PREFIX + "p-"
+CHAIN_FIP_DNAT = FELIX_PREFIX + 'FIP-DNAT'
+CHAIN_FIP_SNAT = FELIX_PREFIX + 'FIP-SNAT'
 
 # Name of the global, stateless IP-in-IP device name.
 IP_IN_IP_DEV_NAME = "tunl0"
@@ -163,7 +167,7 @@ def profile_to_chain_name(inbound_or_outbound, profile_id):
 
 
 def install_global_rules(config, v4_filter_updater, v6_filter_updater,
-                         v4_nat_updater, v6_raw_updater):
+                         v4_nat_updater, v6_nat_updater, v6_raw_updater):
     """
     Set up global iptables rules. These are rules that do not change with
     endpoint, and are expected never to change (such as the rules that send all
@@ -204,21 +208,37 @@ def install_global_rules(config, v4_filter_updater, v6_filter_updater,
         async=False,
     )
 
-    # The IPV4 nat table first. This must have a felix-PREROUTING chain.
-    nat_pr = []
-    if config.METADATA_IP is not None:
-        # Need to expose the metadata server on a link-local.
-        #  DNAT tcp -- any any anywhere 169.254.169.254
-        #              tcp dpt:http to:127.0.0.1:9697
-        nat_pr.append("--append " + CHAIN_PREROUTING + " "
-                      "--protocol tcp "
-                      "--dport 80 "
-                      "--destination 169.254.169.254/32 "
-                      "--jump DNAT --to-destination %s:%s" %
-                      (config.METADATA_IP, config.METADATA_PORT))
-    v4_nat_updater.rewrite_chains({CHAIN_PREROUTING: nat_pr}, {}, async=False)
-    v4_nat_updater.ensure_rule_inserted(
-        "PREROUTING --jump %s" % CHAIN_PREROUTING, async=False)
+    # Both IPV4 and IPV6 nat tables need felix-PREROUTING and felix-POSTROUTING.
+    for ip_up, metadata_ip in [(v4_nat_updater, config.METADATA_IP),
+                               (v6_nat_updater, None)]:
+        nat_pre = ["--append %s --jump %s" % (CHAIN_PREROUTING, CHAIN_FIP_DNAT)]
+        nat_post = ["--append %s --jump %s" % (CHAIN_POSTROUTING,
+                                               CHAIN_FIP_SNAT)]
+        if metadata_ip:
+            # Need to expose the metadata server on a link-local.
+            #  DNAT tcp -- any any anywhere 169.254.169.254
+            #              tcp dpt:http to:127.0.0.1:9697
+            nat_pre.append("--append %s --protocol tcp --dport 80 "
+                           "--destination 169.254.169.254/32 --jump DNAT "
+                           "--to-destination %s:%s" % (CHAIN_PREROUTING,
+                                                       metadata_ip,
+                                                       config.METADATA_PORT))
+
+        ip_up.rewrite_chains(
+            {
+                CHAIN_FIP_DNAT: [],
+                CHAIN_FIP_SNAT: [],
+                CHAIN_PREROUTING: nat_pre,
+                CHAIN_POSTROUTING: nat_post
+            }, {
+                CHAIN_PREROUTING: [CHAIN_FIP_DNAT],
+                CHAIN_POSTROUTING: [CHAIN_FIP_SNAT]
+            }, async=False
+        )
+        ip_up.ensure_rule_inserted("PREROUTING --jump %s" % CHAIN_PREROUTING,
+                                   async=False)
+        ip_up.ensure_rule_inserted("POSTROUTING --jump %s" % CHAIN_POSTROUTING,
+                                   async=False)
 
     # Now the filter table. This needs to have felix-FORWARD and felix-INPUT
     # chains, which we must create before adding any rules that send to them.
