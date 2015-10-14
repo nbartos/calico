@@ -1,5 +1,7 @@
 # Changelog
 
+- Add floating IP support (via 1:1 NAT) in Felix.
+
 ## 1.2.0
 
 - Add liveness reporting to Felix.  Felix now reports its liveness into
