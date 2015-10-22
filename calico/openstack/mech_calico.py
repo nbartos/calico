@@ -36,6 +36,7 @@ from sqlalchemy import exc as sa_exc
 from neutron.common import constants
 from neutron.common.exceptions import PortNotFound
 from neutron.db import models_v2
+from neutron.db import l3_db
 from neutron.plugins.ml2 import driver_api as api
 from neutron.plugins.ml2.drivers import mech_agent
 from neutron import context as ctx
@@ -486,10 +487,23 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                 self._icehouse_migration_step(context, port, original)
             elif port_bound(original) and port_bound(port):
                 LOG.info("Port update")
-                self._update_port(context, port)
+                self._update_port(context._plugin_context, port)
             else:
                 LOG.info("Update on unbound port: no action")
                 pass
+
+    @retry_on_cluster_id_change
+    @requires_state
+    def update_floatingip(self, plugin_context):
+        """
+        Called after a Neutron floating IP has been associated or
+        disassociated from a port.
+        """
+        LOG.info('UPDATE_FLOATINGIP: %s', plugin_context)
+
+        with plugin_context.session.begin(subtransactions=True):
+            port = self.db.get_port(plugin_context, plugin_context.fip_update_port_id)
+            self._update_port(plugin_context, port)
 
     @retry_on_cluster_id_change
     @requires_state
@@ -583,7 +597,7 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         self._port_unbound_update(context, original)
         self._port_bound_update(context, port)
 
-    def _update_port(self, context, port):
+    def _update_port(self, plugin_context, port):
         """
         Called during port updates that have nothing to do with migration.
         """
@@ -599,13 +613,13 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         if not port_disabled:
             LOG.info("Port enabled, attempting to update.")
 
-            with context._plugin_context.session.begin(subtransactions=True):
-                port = self.db.get_port(context._plugin_context, port['id'])
+            with plugin_context.session.begin(subtransactions=True):
+                port = self.db.get_port(plugin_context, port['id'])
                 port = self.add_extra_port_information(
-                    context._plugin_context, port
+                    plugin_context, port
                 )
                 profiles = self.get_security_profiles(
-                    context._plugin_context, port
+                    plugin_context, port
                 )
                 self.transport.endpoint_created(port)
 
@@ -1020,12 +1034,29 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             )
         ]
 
+    def get_floating_ips_for_port(self, context, port):
+        """
+        Obtains a list of floating IPs for a port.
+        """
+        return [
+            {'in_ip': ip['fixed_ip_address'],
+             'out_ip': ip['floating_ip_address']}
+            for ip in context.session.query(
+                l3_db.FloatingIP
+            ).filter_by(
+                fixed_port_id=port['id']
+            )
+        ]
+
     def add_extra_port_information(self, context, port):
         """
         Gets extra information for a port that is needed before sending it to
         etcd.
         """
         port['fixed_ips'] = self.get_fixed_ips_for_port(
+            context, port
+        )
+        port['floating_ips'] = self.get_floating_ips_for_port(
             context, port
         )
         port['security_groups'] = self.get_security_groups_for_port(
