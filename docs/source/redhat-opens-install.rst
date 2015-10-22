@@ -312,17 +312,10 @@ On each control node, perform the following steps:
    OpenStack packages and to ``dnsmasq``.  (OpenStack updates are not needed
    for Liberty.)
 
-3. Edit the ``/etc/neutron/plugins/ml2/ml2_conf.ini`` file.  In the `[ml2]`
-   section:
+3. Edit the ``/etc/neutron/neutron.conf`` file.  In the `[DEFAULT]` section:
 
-   -  Find the ``type_drivers`` setting and change it to read
-      ``type_drivers = local, flat``.
-   -  Find the ``tenant_network_types`` setting and change it to read
-      ``tenant_network_types = local``.
-   -  Find the ``mechanism_drivers`` setting and change it to read
-      ``mechanism_drivers = calico``.
-
-4. Edit the ``/etc/neutron/neutron.conf`` file.  In the `[DEFAULT]` section:
+   -  Find the line beginning with ``core_plugin``, and change it to read
+      ``core_plugin = calico.openstack.core_calico.CalicoCorePlugin``.
 
    -  Find the line for the ``dhcp_agents_per_network`` setting,
       uncomment it, and set its value to the number of compute nodes
@@ -331,13 +324,13 @@ On each control node, perform the following steps:
       because the networks on different compute nodes are not bridged
       together.
 
-5. Install the ``calico-control`` package:
+4. Install the ``calico-control`` package:
 
    ::
 
        yum install calico-control
 
-6. Restart the neutron server process:
+5. Restart the neutron server process:
 
    ::
 
